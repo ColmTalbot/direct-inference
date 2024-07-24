@@ -138,10 +138,11 @@ def draw_single(
     prng_key, *subkeys = jax.random.split(prng_key, 6)
     args = ((), float)  # shape, dtype
     params = BURST_DEFAULTS.copy()
-    if "frequency" in bounds:
-        params["frequency"] = jax.random.normal(subkeys[-1], *args) * sigma_frequency + mean_frequency
     for ii, (key, value) in enumerate(bounds.items()):
-        params[key] = jax.random.uniform(subkeys[ii], *args, *value)
+        if key == "frequency":
+            params["frequency"] = jax.random.normal(subkeys[-1], *args) * sigma_frequency + mean_frequency
+        else:
+            params[key] = jax.random.uniform(subkeys[ii], *args, *value)
     return BurstParameters(**params)
 
 
