@@ -1,0 +1,13 @@
+name: direct-inference
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - dill
+  - jax==0.4.27
+  - jaxlib
+  - jupyterlab
+  - matplotlib
+  - numpyro==0.13.2
+  - scikit-learn
+  - tqdm
