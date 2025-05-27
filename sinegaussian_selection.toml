@@ -1,0 +1,40 @@
+duration = 4
+sample_rate = 256
+frequency_evaluation_bounds = [4.8, 5.2]
+plot_points = 11
+truncation = 20
+
+[bounds]
+amplitude = [80, 5]
+frequency = [5, 0.2]
+bandwidth = [0.5, 0.01]
+phase = [0, 3.141592653589793]
+delta_t = [0.0, 0.01]
+
+[svd]
+population_size = 1000
+keys = ["frequency", "bandwidth"]
+
+[selection]
+n_events = 2000
+order = 1
+n_points = 5000
+
+[simulate]
+n_events = 2000
+
+[simulations]
+n_trials = 150
+
+[hba]
+num_warmup = 250
+num_samples = 250
+num_chains = 1
+jit_model_args = true
+progress_bar = false
+phase_marginalization = true
+
+[configurations]
+sigma = [0.3, 0.4, 0.6, 0.8, 0.35, 0.45, 0.65, 0.85]
+threshold = [11, 11, 11, 11, 0, 0, 0, 0]
+offset = 0

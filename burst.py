@@ -6,7 +6,7 @@ import dill
 import jax
 import jax.numpy as np
 from numpyro import deterministic, factor, sample
-from numpyro.distributions import Uniform
+from numpyro.distributions import Uniform, Normal, TruncatedNormal
 from tqdm.auto import tqdm
 
 from utils import (
@@ -16,9 +16,11 @@ from utils import (
     infft,
     kl_divergence_from_signals,
     nfft,
-    projection_matrix,
     segment_times,
 )
+
+FMIN = 0
+FMAX = 10
 
 
 @dataclass
@@ -73,26 +75,22 @@ def gausspulse_complex(
         The peak time of the signal relative to the midpoint of the
         time series [s].
     """
-    ref = np.power(10.0, -6 / 20.0)
+    ref = np.power(10.0, -0.3)
     a = -((np.pi * parameters.frequency * parameters.bandwidth) ** 2) / (
         4.0 * np.log(ref)
     )
 
-    if isinstance(parameters.phase, (int, float)):
-        parameters.phase = np.ones(parameters.frequency.shape) * parameters.phase
-    if isinstance(parameters.delta_t, (int, float)) or parameters.delta_t.shape == ():
-        times = times + parameters.delta_t
-        ft = np.outer(parameters.frequency, times)
+    if parameters.delta_t.ndim == 1:
+        times = times[:, np.newaxis] - parameters.delta_t
     else:
-        times = times[None, :] + np.atleast_2d(parameters.delta_t).T
-        ft = np.atleast_2d(parameters.frequency).T * times
+        times = times + parameters.delta_t
+    ft = parameters.frequency * times
     yenv = (
-        np.exp(-np.outer(a, times**2))
-        * np.atleast_2d(parameters.bandwidth * parameters.frequency).T ** 0.25
+        np.exp(-a * times**2)
+        * (parameters.bandwidth * parameters.frequency) ** 0.25
     )
     yenv *= (64 / sample_rate) ** 0.5
-
-    exponent = 2 * (np.pi * ft + np.atleast_2d(parameters.phase).T)
+    exponent = 2 * (np.pi * ft + parameters.phase)
     return np.nan_to_num(yenv * np.exp(1j * exponent)).squeeze()
 
 
@@ -113,7 +111,7 @@ def generic_signal(
 ) -> np.ndarray:
     return (
         np.atleast_1d(parameters.amplitude)
-        * signal_function(times, parameters, sample_rate=sample_rate).T
+        * signal_function(times, parameters, sample_rate=sample_rate)
     ).T
 
 
@@ -140,7 +138,14 @@ def draw_single(
     params = BURST_DEFAULTS.copy()
     for ii, (key, value) in enumerate(bounds.items()):
         if key == "frequency":
-            params["frequency"] = jax.random.normal(subkeys[-1], *args) * sigma_frequency + mean_frequency
+            # value = (mean_frequency, sigma_frequency)
+            low = (FMIN - mean_frequency) / sigma_frequency
+            high = (FMAX - mean_frequency) / sigma_frequency
+            params[key] = jax.random.truncated_normal(
+                subkeys[ii], low, high, shape=(), dtype=float
+            ) * sigma_frequency + mean_frequency
+        elif key in ["frequency", "amplitude", "bandwidth", "delta_t"]:
+            params[key] = jax.random.normal(subkeys[ii], shape=(), dtype=float) * value[1] + value[0]
         else:
             params[key] = jax.random.uniform(subkeys[ii], *args, *value)
     return BurstParameters(**params)
@@ -197,24 +202,23 @@ def simulate_event(
         / 2
     )
     sig += noise
+    # sig = noise
     return sig, parameters
 
 
 def construct_numpyro_model(duration, sample_rate, bounds, phase_marginalization=True):
-    times = np.linspace(
-        -duration // 2, duration // 2, sample_rate * duration, endpoint=False
-    )
+    times = segment_times(duration, sample_rate)
 
     def numpyro_model(event: np.ndarray):
-        amplitude = sample("amplitude", Uniform(*bounds["amplitude"]))
-        frequency = sample("frequency", Uniform(*bounds["frequency"]))
-        bandwidth = sample("bandwidth", Uniform(*bounds["bandwidth"]))
+        amplitude = sample("amplitude", Normal(*bounds["amplitude"]))
+        frequency = sample("frequency", TruncatedNormal(*bounds["frequency"], low=FMIN, high=FMAX))
+        bandwidth = sample("bandwidth", Normal(*bounds["bandwidth"]))
         if phase_marginalization:
             phase = deterministic("phase", 0.0)
         else:
             phase = sample("phase", Uniform(*bounds["phase"]))
         if "delta_t" in bounds:
-            delta_t = sample("delta_t", Uniform(*bounds["delta_t"]))
+            delta_t = sample("delta_t", Normal(*bounds["delta_t"]))
         else:
             delta_t = deterministic("delta_t", 0.0)
         parameters = BurstParameters(
@@ -232,10 +236,72 @@ def construct_numpyro_model(duration, sample_rate, bounds, phase_marginalization
                 signals=nfft(template, sample_rate),
                 duration=duration,
                 phase_marginalization=phase_marginalization,
-            ),
+            ).squeeze(),
         )
 
     return numpyro_model
+
+
+def create_jaxted_arguments(duration, sample_rate, bounds, phase_marginalization=True):
+    times = segment_times(duration, sample_rate)
+
+    boundary_fn = None
+
+    def jaxted_ln_likelihood(parameters, *, event, **kwargs):
+        parameters = BurstParameters(
+            amplitude=parameters["amplitude"],
+            frequency=parameters["frequency"],
+            bandwidth=parameters["bandwidth"],
+            phase=parameters["phase"],
+            delta_t=parameters["delta_t"],
+        )
+        # print(parameters["amplitude"].ndim, parameters["amplitude"].shape)
+        template = signal(
+            parameters, times=times, sample_rate=sample_rate
+        )
+        return event_ln_likelihood(
+            event=event,
+            signals=nfft(template, sample_rate),
+            duration=duration,
+            phase_marginalization=phase_marginalization,
+        ).squeeze()
+    
+    def truncated_normal_ln_prob(value, mu, sigma, low, high):
+        return -0.5 * ((value - mu) / sigma) ** 2  + np.log(value >= low) + np.log(value <= high)
+    
+    def jaxted_ln_prior(parameters, *args, **kwargs):
+        ln_prob = (
+            truncated_normal_ln_prob(parameters["amplitude"], *bounds["amplitude"], -np.inf, np.inf)
+            + truncated_normal_ln_prob(parameters["frequency"], *bounds["frequency"], FMIN, FMAX)
+            + truncated_normal_ln_prob(parameters["bandwidth"], *bounds["bandwidth"], -np.inf, np.inf)
+        )
+        # ln_prob += np.log(parameters["frequency"] >= FMIN) + np.log(parameters["frequency"] <= FMAX)
+        if not phase_marginalization:
+            ln_prob += np.log(parameters["phase"] >= bounds["phase"][0]) + np.log(parameters["phase"] <= bounds["phase"][1])
+        if "delta_t" in bounds:
+            ln_prob += truncated_normal_ln_prob(parameters["delta_t"], *bounds["delta_t"], -np.inf, np.inf)
+        return ln_prob
+
+    def jaxted_sample_prior(n_samples, rng_key, *args, **kwargs):
+        # rng_key = jax.random.PRNGKey(10000)
+        lowf = (FMIN - bounds["frequency"][0]) / bounds["frequency"][1]
+        highf = (FMAX - bounds["frequency"][0]) / bounds["frequency"][1]
+        keys = jax.random.split(rng_key, 5)
+        return dict(
+            amplitude=jax.random.normal(keys[0], (n_samples,)) * bounds["amplitude"][1] + bounds["amplitude"][0],
+            frequency=jax.random.truncated_normal(keys[1], lowf, highf, (n_samples,)) * bounds["frequency"][1] + bounds["frequency"][0],
+            # frequency=jax.random.uniform(keys[1], (n_samples,), minval=FMIN, maxval=FMAX),
+            bandwidth=jax.random.normal(keys[2], (n_samples,)) * bounds["bandwidth"][1] + bounds["bandwidth"][0],
+            phase=jax.random.uniform(keys[3], (n_samples,), *bounds["phase"]) if not phase_marginalization else np.zeros((n_samples,)),
+            delta_t=jax.random.normal(keys[4], (n_samples,)) * bounds["delta_t"][1] + bounds["delta_t"][1] if "delta_t" in bounds else np.zeros((n_samples,)),
+            # amplitude=sample("amplitude", Normal(*bounds["amplitude"], shape=(n_samples,))),
+            # frequency=sample("frequency", TruncatedNormal(*bounds["frequency"], low=FMIN, high=FMAX, shape=(n_samples,))),
+            # bandwidth=sample("bandwidth", Normal(*bounds["bandwidth"], shape=(n_samples,))),
+            # phase=sample("phase", Uniform(*bounds["phase"], shape=(n_samples,))) if not phase_marginalization else 0.0,
+            # delta_t=sample("delta_t", Normal(*bounds["delta_t"], shape=(n_samples,))) if "delta_t" in bounds else 0.0,
+        )
+
+    return jaxted_ln_likelihood, jaxted_ln_prior, jaxted_sample_prior, boundary_fn        
 
 
 @partial(jax.vmap, in_axes=(0, None, None, None, None, None, None))
@@ -279,7 +345,7 @@ def simulate_many(rng, mean, sigma, sample_rate, duration, times, bounds):
 def simulate_population(
     rng_key,
     basis,
-    project,
+    projection,
     mean,
     sigma,
     bounds,
@@ -308,10 +374,6 @@ def simulate_population(
     basis: ndarray
         The basis functions, shape
         (:code:`n_filters`, :code:`duration * sample_rate`).
-    project: ndarray
-        The projection matrix, see :func:`projection_matrix`, shape
-        (:code:`n_time_shift_filters`, :code:`time_window`,
-        :code:`duration * sample_rate`).
     mean: float
         The mean frequency of the population.
     sigma: float
@@ -352,8 +414,9 @@ def simulate_population(
     truths.append(truths2)
     td_truths = infft(events, sample_rate=sample_rate).T
     filtered, snrs, _ = apply_filter_multiple(
-        td_truths, project, basis, time_align=time_align
+        td_truths, basis, projection, time_align=time_align
     )
+    # jax.debug.print("{} {}", np.mean(snrs), np.std(snrs))
     keep = snrs > threshold
     return events, truths, keep, rng_key, filtered.T
 
@@ -364,13 +427,13 @@ def kl_divergence_filter(
     population_size: int,
     ntrials: int,
     basis: np.ndarray,
-    projection: np.ndarray,
     bounds: dict,
     sample_rate: float,
     duration: float,
     threshold: float = 0,
     fpeaks: np.ndarray = np.linspace(4.8, 5.2, 11),
     time_align: bool = True,
+    weights: np.ndarray = 1,
 ) -> np.ndarray:
     """
     Run a population simulation to estimate the KL divergence between an observed population
@@ -419,7 +482,7 @@ def kl_divergence_filter(
 
     simulate_kwargs = dict(
         basis=basis,
-        project=projection,
+        projection=weights,
         bounds=bounds,
         times=times,
         duration=duration,
@@ -438,7 +501,7 @@ def kl_divergence_filter(
             **simulate_kwargs,
         )
         signals_2 = signals_2[keep][:target_population_size]
-        dimensions = signals_2.shape[-1] / 2
+        dimensions = signals_2.shape[-1]
         kl_div = kl_divergence_from_signals(signals_1, signals_2, dimensions=dimensions)
         pbar.update()
         return kl_div, None
@@ -456,8 +519,9 @@ def kl_divergence_filter(
 
 
 def load_basis(filename: str, truncation: int = 40) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    _, weights, basis = np.load(filename, allow_pickle=True)
-    basis = basis[:truncation]
-    weights = weights[:truncation]
-    projection = projection_matrix(basis, weights, truncation=10)
-    return basis, weights, projection
+    u, weights, basis = np.load(filename, allow_pickle=True)
+    basis = basis[:truncation].conjugate()
+    projection = u[:, :truncation] * weights[:truncation]
+    print(projection.shape, basis.shape)
+    # return basis * weights[:, None], weights
+    return basis, projection

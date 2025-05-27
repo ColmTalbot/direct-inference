@@ -1,13 +1,14 @@
 from dataclasses import dataclass
 from functools import partial
 
+import numpy
 import jax.numpy as np
-from jax import jit, vmap
-from jax.lax import cond
-from jax.tree_util import register_pytree_node
+from jax import grad, jit, random, vmap, Array
+from jax.lax import cond, fori_loop
 from jax.scipy.linalg import toeplitz
 from jax.scipy.special import i0e
 from jax.scipy.stats import sem
+from jax.tree_util import register_pytree_node
 from sklearn.neighbors import NearestNeighbors
 
 
@@ -60,7 +61,7 @@ class Parameters:
         register_pytree_node(cls, cls._tree_flatten, cls._tree_unflatten)
 
     def __getitem__(self, idx: str | slice) -> np.ndarray:
-        if isinstance(idx, (int, slice)):
+        if isinstance(idx, (int, slice, numpy.ndarray, Array)):
             kwargs = {key: value[idx] for key, value in self.__dict__.items()}
             return self.__class__(**kwargs)
         else:
@@ -81,7 +82,7 @@ class Parameters:
         this = self.__dict__
         that = other.__dict__
         for key in self.__dict__:
-            setattr(self, key, np.concatenate([this[key], that[key]]))
+            setattr(self, key, np.hstack([this[key], that[key]]))
 
     def __iter__(self) -> "Parameters":
         for idx in range(len(self)):
@@ -117,7 +118,7 @@ def segment_times(duration: float, sample_rate: float) -> np.ndarray:
     )
 
 
-def apply_filter_multiple(data, projection, basis, time_align=True):
+def apply_filter_multiple(data, basis, projection, time_align=True):
     """
     Apply the matched filter bank to multiple time series.
 
@@ -132,10 +133,6 @@ def apply_filter_multiple(data, projection, basis, time_align=True):
     data: ndarray
         The time series data to filter, shape
         (:code:`n_events`, :code:`duration * sample_rate`).
-    projection: ndarray
-        The projection matrix, see :func:`projection_matrix`, shape
-        (:code:`n_time_shift_filters`, :code:`time_window`,
-        :code:`duration * sample_rate`).
     basis: ndarray
         The basis functions, shape
         (:code:`n_filters`, :code:`duration * sample_rate`).
@@ -154,16 +151,36 @@ def apply_filter_multiple(data, projection, basis, time_align=True):
         ratio, shape (:code:`n_events`,).
     """
     if time_align:
-        U = projection @ data / len(data)
-        snr_time_series = (abs(U) ** 2).sum(axis=0)
-        delta = -np.argmax(snr_time_series, axis=0)
+        import jax
+        def func(carry, x):
+            basis, temp = carry
+            val = jax.lax.dynamic_slice_in_dim(temp, x, basis.shape[-1], axis=0)
+            snr = np.max(abs(projection @ basis @ val), axis=0)**0.5
+            # snr = (abs(basis @ val)**2).sum(axis=0)**0.5
+            return carry, snr
+        new_shape = (50, *data.shape[1:])
+        temp = np.concatenate([np.zeros(new_shape), data, np.zeros(new_shape)])
+        _, snr_time_series = jax.lax.scan(func, (basis, temp), np.arange(len(temp) - basis.shape[-1]))
+        delta = np.atleast_1d(-np.argmax(snr_time_series, axis=0) + 50)
         data = vmap(np.roll, in_axes=(1, 0))(data, delta).T
     else:
         delta = 0
-    filtered = 2 * basis.conjugate() @ data
-    snr = (abs(filtered) ** 2).sum(axis=0) / len(data)
-    filtered = filtered.real
-    return filtered, snr**0.5, delta
+    filtered = basis.conjugate() @ data
+    snr = np.max(abs(projection @ filtered), axis=0)**0.5
+    hri = (filtered.real * filtered.imag).sum(axis=0)
+    hii = (filtered.imag**2).sum(axis=0)
+    hrr = (filtered.real**2).sum(axis=0)
+    angle = np.arctan(2 * hri / (hii - hrr)) / 2
+    filtered *= np.exp(-1j * angle)
+    filtered = np.concatenate([filtered.real, filtered.imag], axis=0)
+    # snr = 2 * (filtered ** 2).sum(axis=0) / len(data)
+    # snr = (basis.T @ filtered).sum()
+    # snr = 2 * (basis.T @ filtered.conjugate() * data).sum(axis=0) / len(data)
+    # snr = (filtered).sum(axis=0) / len(data)
+    # print(snr)
+    # filtered = (filtered * np.exp(-1j * np.angle(snr))).real
+    # filtered = filtered.real
+    return filtered, snr, delta
 
 
 @jit
@@ -188,9 +205,10 @@ def _population_weights(posteriors, mean_frequency, sigma_frequency):
     sigma_frequency: float
         The standard deviation of the population, :math:`\sigma`.
     """
-    original_prior = 1 / (9 - 1)
+    # original_prior = 1 / (9 - 1)
+    original_prior = np.exp(-0.5 * (posteriors - 5) ** 2 / sigma_frequency**2)
     pop_weights = np.exp(-0.5 * (posteriors - mean_frequency) ** 2 / sigma_frequency**2)
-    pop_weights /= (2 * np.pi) ** 0.5 * sigma_frequency
+    # pop_weights /= (2 * np.pi) ** 0.5 * sigma_frequency
     return pop_weights / original_prior
 
 
@@ -515,7 +533,7 @@ def whiten(input: np.ndarray, psd: np.ndarray) -> np.ndarray:
 def kl_divergence_from_signals(
     signals_1: np.ndarray, signals_2: np.ndarray, dimensions: int
 ) -> np.ndarray:
-    n_neighbours = 30
+    n_neighbours = 5
 
     true = signals_1
     other = signals_2
@@ -541,10 +559,11 @@ def make_plots(
     *divergences: np.ndarray,
     mode: str = "KL",
     xlabel: str = "Population mean frequency [Hz]",
+    nevents = 1,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    plt.figure(figsize=(8, 5))
+    fig = plt.figure(figsize=(8, 5))
     for ii, quantity in enumerate(divergences):
         if len(divergences) == 2:
             label = ["Approximation", "Standard"][ii]
@@ -552,23 +571,39 @@ def make_plots(
             label = ["Approximation", None, "Traditional"][ii]
         if mode == "events":
             quantity = 1 / quantity
-        plt.errorbar(
-            fpeaks,
-            np.nanmean(quantity, axis=-1),
-            yerr=sem(quantity, axis=-1, nan_policy="omit"),
-            label=label,
-            color=f"C{ii}",
-        )
-        plt.fill_between(
-            fpeaks,
-            np.percentile(quantity, 5, axis=-1),
-            np.percentile(quantity, 95, axis=-1),
-            alpha=0.3,
-            color=f"C{ii}",
-        )
-        plt.plot(
-            fpeaks, quantity, alpha=min(0.2, 1 / quantity.shape[-1]), color=f"C{ii}"
-        )
+        elif mode == "likelihood":
+            plt.yscale("log")
+            quantity = np.exp(-quantity * nevents)
+        if quantity.ndim == 2:
+            label = "Approximation"
+            if mode == "likelihood":
+                plt.plot(
+                    fpeaks,
+                    np.median(quantity, axis=-1),
+                    label=label,
+                    color=f"C{ii}",
+                )
+            else:
+                plt.errorbar(
+                    fpeaks,
+                    np.nanmean(quantity, axis=-1),
+                    yerr=sem(quantity, axis=-1, nan_policy="omit"),
+                    label=label,
+                    color=f"C{ii}",
+                )
+            plt.fill_between(
+                fpeaks,
+                np.percentile(quantity, 5, axis=-1),
+                np.percentile(quantity, 95, axis=-1),
+                alpha=0.3,
+                color=f"C{ii}",
+            )
+            plt.plot(
+                fpeaks, quantity, alpha=min(0.2, 1 / quantity.shape[-1]), color=f"C{ii}"
+            )
+        elif quantity.ndim == 1:
+            label = "Traditional"
+            plt.plot(fpeaks, quantity, label=label, color=f"C{ii}")
     if mode == "events":
         plt.ylabel("Number of events")
     else:
@@ -577,5 +612,47 @@ def make_plots(
     plt.xlim(fpeaks[0], fpeaks[-1])
     if len(divergences) > 0:
         plt.legend(loc="best")
+    
+    plt.tight_layout()
+    plt.savefig("kl_divs.pdf", transparent=True)
     plt.show()
     plt.close()
+    return fig
+
+
+class multivariate_normal:
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        register_pytree_node(cls, cls._tree_flatten, cls._tree_unflatten)
+
+    def __init__(self, mean, cov=None, prec=None):
+        self.mean = mean
+        if cov is None and prec is None:
+            raise ValueError("Either cov or prec must be provided")
+        elif cov is not None and prec is not None:
+            self.cov = cov
+            self.prec = prec
+        elif cov is not None:
+            self.cov = cov
+            self.prec = np.linalg.inv(cov)
+        else:
+            self.prec = prec
+            self.cov = np.linalg.inv(prec)
+        self.lognorm = -0.5 * (np.linalg.slogdet(2 * np.pi * self.cov)[1])
+
+    def rvs(self, rng_key, shape=None):
+        return random.multivariate_normal(rng_key, self.mean, self.cov, shape=shape, method="svd")
+
+    def logpdf(self, x):
+        z = x - self.mean
+        return self.lognorm - np.einsum("...i,ij,...j->...", z, self.prec, z) / 2
+    
+    def _tree_flatten(self) -> tuple[tuple, dict]:
+        children = (self.mean, self.cov, self.prec)
+        aux_data = {}
+        return children, aux_data
+
+    @classmethod
+    def _tree_unflatten(cls, aux_data: dict, children: tuple) -> "multivariate_normal":
+        return cls(*children, **aux_data)
